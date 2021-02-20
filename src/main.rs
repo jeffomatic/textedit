@@ -2,7 +2,7 @@ extern crate termios;
 
 use std::io::Write;
 use std::io::{ErrorKind, Read};
-use std::{fs::File, io, os::unix::io::FromRawFd};
+use std::{fs::File, io, os::unix::io::AsRawFd};
 use termios::{
     tcsetattr, Termios, BRKINT, CS8, ECHO, ICANON, ICRNL, IEXTEN, INPCK, ISIG, ISTRIP, IXON, OPOST,
     TCSAFLUSH, VMIN, VTIME,
@@ -43,15 +43,16 @@ fn ctrl_chord(c: u8) -> u8 {
 }
 
 fn main() {
-    let tty_fd = 0;
     let stdout = io::stdout();
 
+    let mut istream = File::open("/dev/tty").unwrap();
+    let tty_fd = istream.as_raw_fd();
     let orig_termios = Termios::from_fd(tty_fd).unwrap();
+
     let mut raw_termios = orig_termios.clone();
     raw_mode_params(&mut raw_termios);
     tcsetattr(tty_fd, TCSAFLUSH, &raw_termios).unwrap();
 
-    let mut istream = unsafe { File::from_raw_fd(tty_fd) };
     loop {
         let mut buf = [0; 1];
         if let Err(e) = istream.read_exact(&mut buf) {
