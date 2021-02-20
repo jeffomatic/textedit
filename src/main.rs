@@ -1,6 +1,5 @@
 extern crate termios;
 
-use std::io::Write;
 use std::io::{ErrorKind, Read};
 use std::{fs::File, io, os::unix::io::AsRawFd};
 use termios::{
@@ -42,36 +41,50 @@ fn ctrl_chord(c: u8) -> u8 {
     c & 0x1f
 }
 
+fn read_key(input: &mut dyn Read) -> Result<u8, std::io::Error> {
+    let mut buf = [0; 1];
+    loop {
+        match input.read_exact(&mut buf) {
+            Ok(()) => return Ok(buf[0]),
+            Err(e) => {
+                // UnexpectedEof is generally a read timeout, which is safe to
+                // ignore. We should die on other errors.
+                if e.kind() != ErrorKind::UnexpectedEof {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+fn handle_input(input: &mut dyn Read) -> Result<bool, std::io::Error> {
+    match read_key(input)? {
+        c if c == ctrl_chord(b'q') => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+fn refresh_screen(output: &mut dyn std::io::Write) -> Result<(), std::io::Error> {
+    output.write_all(b"\x1b[2J")?;
+    output.flush()?;
+    Ok(())
+}
+
 fn main() {
     let stdout = io::stdout();
 
-    let mut istream = File::open("/dev/tty").unwrap();
-    let tty_fd = istream.as_raw_fd();
-    let orig_termios = Termios::from_fd(tty_fd).unwrap();
+    let mut input = File::open("/dev/tty").unwrap();
+    let mut output = stdout.lock();
 
+    let tty_fd = input.as_raw_fd();
+    let orig_termios = Termios::from_fd(tty_fd).unwrap();
     let mut raw_termios = orig_termios.clone();
     raw_mode_params(&mut raw_termios);
     tcsetattr(tty_fd, TCSAFLUSH, &raw_termios).unwrap();
 
     loop {
-        let mut buf = [0; 1];
-        if let Err(e) = istream.read_exact(&mut buf) {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                // just continue if the read call times out
-                continue;
-            }
-        }
-
-        let c = buf[0];
-        if c.is_ascii_control() {
-            print!("{}", c);
-        } else {
-            print!("{}", c as char);
-        }
-
-        stdout.lock().flush().unwrap();
-
-        if c == ctrl_chord(b'q') {
+        refresh_screen(&mut output).unwrap();
+        if handle_input(&mut input).unwrap() {
             break;
         }
     }
