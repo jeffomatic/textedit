@@ -8,9 +8,7 @@ use termios::{
     TCSAFLUSH, VMIN, VTIME,
 };
 
-fn enter_raw_mode(tty_fd: i32, orig_termios: &Termios) {
-    let mut termios = orig_termios.clone();
-
+fn raw_mode_params(termios: &mut Termios) {
     termios.c_cflag |= CS8; // set character size to 8 bits per byte (probably default)
     termios.c_iflag &= !(
         // don't translate break condition to SIGINT
@@ -38,8 +36,10 @@ fn enter_raw_mode(tty_fd: i32, orig_termios: &Termios) {
 
     termios.c_cc[VMIN] = 0; // minimum number of charcters to read
     termios.c_cc[VTIME] = 1; // read waits 0.1 seconds
+}
 
-    tcsetattr(tty_fd, TCSAFLUSH, &termios).unwrap();
+fn ctrl_chord(c: u8) -> u8 {
+    c & 0x1f
 }
 
 fn main() {
@@ -47,7 +47,9 @@ fn main() {
     let stdout = io::stdout();
 
     let orig_termios = Termios::from_fd(tty_fd).unwrap();
-    enter_raw_mode(tty_fd, &orig_termios);
+    let mut raw_termios = orig_termios.clone();
+    raw_mode_params(&mut raw_termios);
+    tcsetattr(tty_fd, TCSAFLUSH, &raw_termios).unwrap();
 
     let mut istream = unsafe { File::from_raw_fd(tty_fd) };
     loop {
@@ -68,7 +70,7 @@ fn main() {
 
         stdout.lock().flush().unwrap();
 
-        if c == b'q' {
+        if c == ctrl_chord(b'q') {
             break;
         }
     }
