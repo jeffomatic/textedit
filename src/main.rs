@@ -1,12 +1,10 @@
-#[macro_use]
 extern crate nix;
 
 use nix::sys::termios;
-use std::{
-    error::Error,
-    io::{ErrorKind, Read},
-};
-use std::{fs::File, io, os::unix::io::AsRawFd};
+use std::io::{ErrorKind, Read};
+use std::{fs::File, os::unix::io::AsRawFd};
+
+type GenericError = Box<dyn std::error::Error>;
 
 nix::ioctl_read_bad!(
     ioctl_get_win_size,
@@ -16,11 +14,11 @@ nix::ioctl_read_bad!(
 
 #[derive(Debug, Clone, Copy)]
 struct WindowSize {
-    rows: usize,
     cols: usize,
+    rows: usize,
 }
 
-fn get_window_size(fd: i32) -> Result<WindowSize, Box<dyn Error>> {
+fn get_window_size(fd: i32) -> Result<WindowSize, GenericError> {
     let mut res = nix::libc::winsize {
         ws_col: 0,
         ws_row: 0,
@@ -96,58 +94,117 @@ fn read_key(input: &mut dyn Read) -> Result<u8, std::io::Error> {
     }
 }
 
-fn handle_input(input: &mut dyn Read) -> Result<bool, std::io::Error> {
-    match read_key(input)? {
-        c if c == ctrl_chord(b'q') => Ok(true),
-        _ => Ok(false),
+struct Editor<'a> {
+    framebuf: Vec<u8>,
+
+    tty_fd: i32,
+    istream: &'a mut dyn std::io::Read,
+    ostream: &'a mut dyn std::io::Write,
+
+    term_settings: termios::Termios,
+    prev_term_settings: termios::Termios,
+    size: WindowSize,
+}
+
+impl Editor<'_> {
+    fn new<'a>(
+        istream: &'a mut dyn std::io::Read,
+        ostream: &'a mut dyn std::io::Write,
+        tty_fd: i32,
+    ) -> Result<Editor<'a>, GenericError> {
+        let prev_term_settings = termios::tcgetattr(tty_fd)?;
+        let mut term_settings = prev_term_settings.clone();
+        raw_mode_params(&mut term_settings);
+
+        Ok(Editor {
+            framebuf: Vec::new(),
+            istream,
+            ostream,
+            tty_fd,
+            term_settings,
+            prev_term_settings,
+            size: get_window_size(tty_fd)?,
+        })
     }
-}
 
-fn clear_screen(output: &mut dyn std::io::Write) -> Result<(), std::io::Error> {
-    output.write_all(b"\x1b[2J")?; // 2J: erase in display, full screen
-    output.write_all(b"\x1b[H")?; // H: position cursor, first col/row
-    Ok(())
-}
-
-// VT100 escape sequence documentation:
-// https://vt100.net/docs/vt100-ug/chapter3.html
-fn refresh_screen(output: &mut dyn std::io::Write, rows: usize) -> Result<(), std::io::Error> {
-    clear_screen(output)?;
-    draw_rows(output, rows)?;
-    output.flush()?;
-    Ok(())
-}
-
-fn draw_rows(output: &mut dyn std::io::Write, rows: usize) -> Result<(), std::io::Error> {
-    for _ in 0..rows {
-        output.write_all(b"~\r\n")?;
+    fn apply_term_settings(&self) -> Result<(), GenericError> {
+        termios::tcsetattr(self.tty_fd, termios::SetArg::TCSANOW, &self.term_settings)?;
+        Ok(())
     }
 
-    Ok(())
-}
+    fn apply_prev_term_settings(&self) -> Result<(), GenericError> {
+        termios::tcsetattr(
+            self.tty_fd,
+            termios::SetArg::TCSANOW,
+            &self.prev_term_settings,
+        )?;
+        Ok(())
+    }
 
-fn main() {
-    let stdout = io::stdout();
+    fn clear(&mut self) -> Result<(), GenericError> {
+        self.ostream.write_all(b"\x1b[2J")?;
+        self.ostream.write_all(b"\x1b[H")?;
+        self.ostream.flush()?;
+        Ok(())
+    }
 
-    let mut input = File::open("/dev/tty").unwrap();
-    let mut output = stdout.lock();
+    fn render(&mut self) -> Result<(), GenericError> {
+        self.framebuf.clear();
 
-    let tty_fd = input.as_raw_fd();
+        for i in 0..self.size.rows {
+            self.framebuf.push(b'~');
+            if i < self.size.rows - 1 {
+                self.framebuf.push(b'\r');
+                self.framebuf.push(b'\n');
+            }
+        }
 
-    let orig_termios = termios::tcgetattr(tty_fd).unwrap();
-    let mut raw_termios = orig_termios.clone();
-    raw_mode_params(&mut raw_termios);
-    termios::tcsetattr(tty_fd, termios::SetArg::TCSAFLUSH, &raw_termios).unwrap();
+        self.ostream.write_all(&self.framebuf)?;
+        self.ostream.flush()?;
 
-    let size = get_window_size(tty_fd).unwrap();
+        Ok(())
+    }
 
-    loop {
-        refresh_screen(&mut output, size.rows).unwrap();
-        if handle_input(&mut input).unwrap() {
-            break;
+    fn handle_input(&mut self) -> Result<bool, GenericError> {
+        match read_key(self.istream)? {
+            c if c == ctrl_chord(b'q') => Ok(true),
+            _ => Ok(false),
         }
     }
 
-    clear_screen(&mut output).unwrap();
-    termios::tcsetattr(tty_fd, termios::SetArg::TCSAFLUSH, &orig_termios).unwrap();
+    fn update(&mut self) -> Result<bool, GenericError> {
+        self.clear()?;
+        self.render()?;
+
+        if self.handle_input()? {
+            self.clear()?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+}
+
+fn main() {
+    let mut istream = File::open("/dev/tty").unwrap();
+    let tty_fd = istream.as_raw_fd();
+    let stdout = std::io::stdout();
+    let mut ostream = stdout.lock();
+    let mut e = Editor::new(&mut istream, &mut ostream, tty_fd).unwrap();
+
+    e.apply_term_settings().unwrap();
+
+    loop {
+        match e.update() {
+            Ok(true) => break,
+            Ok(false) => (),
+            Err(err) => {
+                e.apply_prev_term_settings().unwrap();
+                eprintln!("{:?}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    e.apply_prev_term_settings().unwrap();
 }
