@@ -94,6 +94,11 @@ fn read_key(input: &mut dyn Read) -> Result<u8, std::io::Error> {
     }
 }
 
+const SHOW_CURSOR: &'static [u8] = b"\x1b[?25h";
+const HIDE_CURSOR: &'static [u8] = b"\x1b[?25l";
+const CLEAR: &'static [u8] = b"\x1b[2J";
+const CURSOR_TO_START: &'static [u8] = b"\x1b[H";
+
 struct Editor<'a> {
     framebuf: Vec<u8>,
 
@@ -141,16 +146,21 @@ impl Editor<'_> {
         Ok(())
     }
 
-    fn clear(&mut self) -> Result<(), GenericError> {
-        self.ostream.write_all(b"\x1b[2J")?;
-        self.ostream.write_all(b"\x1b[H")?;
+    fn print(&mut self, content: &[u8]) {
+        self.framebuf.append(&mut content.iter().cloned().collect());
+    }
+
+    fn flush(&mut self) -> Result<(), GenericError> {
+        self.ostream.write_all(&self.framebuf)?;
         self.ostream.flush()?;
         Ok(())
     }
 
     fn render(&mut self) -> Result<(), GenericError> {
-        self.framebuf.clear();
+        self.print(HIDE_CURSOR);
+        self.print(CLEAR);
 
+        self.framebuf.clear();
         for i in 0..self.size.rows {
             self.framebuf.push(b'~');
             if i < self.size.rows - 1 {
@@ -159,8 +169,8 @@ impl Editor<'_> {
             }
         }
 
-        self.ostream.write_all(&self.framebuf)?;
-        self.ostream.flush()?;
+        self.print(SHOW_CURSOR);
+        self.flush()?;
 
         Ok(())
     }
@@ -173,11 +183,12 @@ impl Editor<'_> {
     }
 
     fn update(&mut self) -> Result<bool, GenericError> {
-        self.clear()?;
         self.render()?;
 
         if self.handle_input()? {
-            self.clear()?;
+            self.print(CLEAR);
+            self.print(CURSOR_TO_START);
+            self.flush()?;
             return Ok(true);
         }
 
