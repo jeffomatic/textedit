@@ -96,7 +96,8 @@ fn read_key(input: &mut dyn Read) -> Result<u8, std::io::Error> {
 
 const SHOW_CURSOR: &'static [u8] = b"\x1b[?25h";
 const HIDE_CURSOR: &'static [u8] = b"\x1b[?25l";
-const CLEAR: &'static [u8] = b"\x1b[2J";
+const CLEAR_SCREEN: &'static [u8] = b"\x1b[2J";
+const CLEAR_LINE: &'static [u8] = b"\x1b[K";
 const CURSOR_TO_START: &'static [u8] = b"\x1b[H";
 
 struct Editor<'a> {
@@ -156,25 +157,6 @@ impl Editor<'_> {
         Ok(())
     }
 
-    fn render(&mut self) -> Result<(), GenericError> {
-        self.print(HIDE_CURSOR);
-        self.print(CLEAR);
-
-        self.framebuf.clear();
-        for i in 0..self.size.rows {
-            self.framebuf.push(b'~');
-            if i < self.size.rows - 1 {
-                self.framebuf.push(b'\r');
-                self.framebuf.push(b'\n');
-            }
-        }
-
-        self.print(SHOW_CURSOR);
-        self.flush()?;
-
-        Ok(())
-    }
-
     fn handle_input(&mut self) -> Result<bool, GenericError> {
         match read_key(self.istream)? {
             c if c == ctrl_chord(b'q') => Ok(true),
@@ -183,10 +165,32 @@ impl Editor<'_> {
     }
 
     fn update(&mut self) -> Result<bool, GenericError> {
-        self.render()?;
+        self.print(HIDE_CURSOR);
+
+        self.framebuf.clear();
+        for i in 0..self.size.rows {
+            self.print(b"~");
+            self.print(CLEAR_LINE);
+
+            if i == self.size.rows / 3 {
+                let welcome = b"Welcome to textedit";
+                let lmargin = (self.size.cols - welcome.len()) / 2 - 1;
+                for _ in 0..lmargin {
+                    self.print(b" ");
+                }
+                self.print(welcome);
+            }
+
+            if i < self.size.rows - 1 {
+                self.print(b"\r\n");
+            }
+        }
+
+        self.print(SHOW_CURSOR);
+        self.flush()?;
 
         if self.handle_input()? {
-            self.print(CLEAR);
+            self.print(CLEAR_SCREEN);
             self.print(CURSOR_TO_START);
             self.flush()?;
             return Ok(true);
