@@ -13,12 +13,12 @@ nix::ioctl_read_bad!(
 );
 
 #[derive(Debug, Clone, Copy)]
-struct WindowSize {
-    cols: usize,
-    rows: usize,
+struct UVec2 {
+    x: usize,
+    y: usize,
 }
 
-fn get_window_size(fd: i32) -> Result<WindowSize, GenericError> {
+fn get_window_size(fd: i32) -> Result<UVec2, GenericError> {
     let mut res = nix::libc::winsize {
         ws_col: 0,
         ws_row: 0,
@@ -30,9 +30,9 @@ fn get_window_size(fd: i32) -> Result<WindowSize, GenericError> {
         ioctl_get_win_size(fd, &mut res)?;
     }
 
-    Ok(WindowSize {
-        cols: res.ws_col as usize,
-        rows: res.ws_row as usize,
+    Ok(UVec2 {
+        x: res.ws_col as usize,
+        y: res.ws_row as usize,
     })
 }
 
@@ -78,20 +78,18 @@ fn ctrl_chord(c: u8) -> u8 {
     c & 0x1f
 }
 
-fn read_key(input: &mut dyn Read) -> Result<u8, std::io::Error> {
+fn read_key(input: &mut dyn Read) -> Result<Option<u8>, std::io::Error> {
     let mut buf = [0; 1];
-    loop {
-        match input.read_exact(&mut buf) {
-            Ok(()) => return Ok(buf[0]),
-            Err(e) => {
-                // UnexpectedEof is generally a read timeout, which is safe to
-                // ignore. We should die on other errors.
-                if e.kind() != ErrorKind::UnexpectedEof {
-                    return Err(e);
-                }
-            }
+    if let Err(e) = input.read_exact(&mut buf) {
+        // UnexpectedEof is generally a read timeout, which is safe to
+        // ignore.
+        if e.kind() == ErrorKind::UnexpectedEof {
+            return Ok(None);
         }
+
+        return Err(e);
     }
+    return Ok(Some(buf[0]));
 }
 
 const SHOW_CURSOR: &'static [u8] = b"\x1b[?25h";
@@ -101,7 +99,9 @@ const CLEAR_LINE: &'static [u8] = b"\x1b[K";
 const CURSOR_TO_START: &'static [u8] = b"\x1b[H";
 
 struct Editor<'a> {
+    curpos: UVec2,
     framebuf: Vec<u8>,
+    quit: bool,
 
     tty_fd: i32,
     istream: &'a mut dyn std::io::Read,
@@ -109,7 +109,7 @@ struct Editor<'a> {
 
     term_settings: termios::Termios,
     prev_term_settings: termios::Termios,
-    size: WindowSize,
+    size: UVec2,
 }
 
 impl Editor<'_> {
@@ -123,7 +123,9 @@ impl Editor<'_> {
         raw_mode_params(&mut term_settings);
 
         Ok(Editor {
+            curpos: UVec2 { x: 0, y: 0 },
             framebuf: Vec::new(),
+            quit: false,
             istream,
             ostream,
             tty_fd,
@@ -154,42 +156,93 @@ impl Editor<'_> {
     fn flush(&mut self) -> Result<(), GenericError> {
         self.ostream.write_all(&self.framebuf)?;
         self.ostream.flush()?;
+        self.framebuf.clear();
         Ok(())
     }
 
     fn handle_input(&mut self) -> Result<bool, GenericError> {
-        match read_key(self.istream)? {
-            c if c == ctrl_chord(b'q') => Ok(true),
-            _ => Ok(false),
+        let res = read_key(self.istream)?;
+        if res.is_none() {
+            return Ok(false);
         }
+
+        let c = res.unwrap();
+
+        // handle quit
+        if c == ctrl_chord(b'q') {
+            self.quit = true;
+            return Ok(true);
+        }
+
+        // handle escape sequences
+        if c == b'\x1b' {
+            if let Some(true) = read_key(self.istream)?.map(|c| c == b'[') {
+                match read_key(self.istream)? {
+                    // up arrow
+                    Some(b'A') => {
+                        if self.curpos.y > 0 {
+                            self.curpos.y -= 1;
+                        }
+                    }
+                    // down arrow
+                    Some(b'B') => {
+                        if self.curpos.y < self.size.y - 1 {
+                            self.curpos.y += 1;
+                        }
+                    }
+                    // right arrow
+                    Some(b'C') => {
+                        if self.curpos.x < self.size.x - 1 {
+                            self.curpos.x += 1;
+                        }
+                    }
+                    // left arrow
+                    Some(b'D') => {
+                        if self.curpos.x > 0 {
+                            self.curpos.x -= 1;
+                        }
+                    }
+                    // do nothing by default
+                    _ => (),
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     fn update(&mut self) -> Result<bool, GenericError> {
         self.print(HIDE_CURSOR);
+        self.print(CURSOR_TO_START);
 
-        self.framebuf.clear();
-        for i in 0..self.size.rows {
+        for i in 0..self.size.y {
             self.print(b"~");
             self.print(CLEAR_LINE);
 
-            if i == self.size.rows / 3 {
+            if i == self.size.y / 3 {
                 let welcome = b"Welcome to textedit";
-                let lmargin = (self.size.cols - welcome.len()) / 2 - 1;
+                let lmargin = (self.size.x - welcome.len()) / 2 - 1;
                 for _ in 0..lmargin {
                     self.print(b" ");
                 }
                 self.print(welcome);
             }
 
-            if i < self.size.rows - 1 {
+            if i < self.size.y - 1 {
                 self.print(b"\r\n");
             }
         }
 
+        let move_cursor = format!("\x1b[{};{}H", self.curpos.y + 1, self.curpos.x + 1);
+        self.print(move_cursor.as_bytes());
         self.print(SHOW_CURSOR);
         self.flush()?;
 
-        if self.handle_input()? {
+        while !self.handle_input()? {
+            // wait for input before moving to next update
+        }
+
+        if self.quit {
             self.print(CLEAR_SCREEN);
             self.print(CURSOR_TO_START);
             self.flush()?;
